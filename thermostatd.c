@@ -8,19 +8,24 @@
 #include <syslog.h>
 #include <time.h>
 #include <errno.h>
+#include <ctype.h>
 #include <curl/curl.h>
 
-#define OK        0
-#define INIT_ERR  1
-#define REQ_ERR   2
+#define OK         0
+#define INIT_ERR   -1
+#define REQ_ERR    -2
+#define CONFIG_ERR -3
+#define TIME_ERR   -4
+#define TEMP_ERR   -5
 
 #define DAEMON_NAME "thermostatd"
-#define ERR_FORK   -1
-#define ERR_SETSID -2
-#define ERR_CHDIR  -3
+#define ERR_FORK   -6
+#define ERR_SETSID -7
+#define ERR_CHDIR  -8
 
 #define URL_TEST       "http://localhost:8000"
 #define URL_PRODUCTION "http://192.168.1.116:80" // Needed when using ARM
+char defaultURL[100];
 
 // This is a holdover from homework.c.  We'll still use GET, PUT and HELP for this program.
 int Action;
@@ -86,6 +91,64 @@ void _uppercase(char* lowercase)
 
 
 //*****************************************************************************
+// We're expecting aTime to have the format "HH:MM".  We need to be able to
+// handle situations where HH or MM are not two digits each, or not numeric.
+//*****************************************************************************
+int _convertTimeToInteger(char* aTime)
+{
+ char Hour[3];
+ char Minute[3];
+ int ret;
+ int x, len, colon;
+
+ len = strlen(aTime);
+
+ if (len != 5) return -1; // if aTime isn't the right length, get out.
+
+ // Find the location of the colon:
+ colon = -1;
+ for (x = 0; x < len; x++)
+ {
+  if (aTime[x] == ':')
+  {
+   colon = x;
+   break;
+  }
+ } // End For (x to len)
+
+ // HH:MM
+ // 01234
+
+ if (colon != 2) return -1; // If colon is not where we expect it, get out.
+
+ if (isDigit(aTime[0]) == 0) return -1; // If any of the parts of
+ if (isDigit(aTime[1]) == 0) return -1; // HH or MM are non-numeric
+ if (isDigit(aTime[3]) == 0) return -1; // get out.
+ if (isDigit(aTime[4]) == 0) return -1;
+
+ // Syntax is OK, now check that HH is in the range 00-23 and
+ // MM is in the range 00-59
+ memset(Hour, '\0', sizeof(Hour));
+ memset(Minute '\0', sizeof(Minute));
+
+ memcpy(Hour, aTime, 2);
+ memcpy(Minute, aTime+3, 2);
+
+ if (atoi(Hour) > 23) return -1;   // Either HH or MM out of range,
+ if (atoi(Minute) > 59) return -1; // then get out.
+
+ // Everything within range. Compute an actual time and express it in
+ // minutes:
+ ret = atoi(Hour);
+ ret *= 60;
+ ret += atoi(Minute);
+
+ return ret;
+
+} // End Function _convertToInteger()
+
+
+//*****************************************************************************
 //*****************************************************************************
 int readConfigFile(void)
 {
@@ -96,8 +159,13 @@ int readConfigFile(void)
  char LeftSide[100];
  char RightSide[100];
 
+ // Initialize our values:
+ morningStart = afternoonStart = nightStart = -1;
+ morningTemp = afternoonTemp = nightTemp = -1;
+ sprintf(defaultURL, "%s\0", URL_TEST);
+
  // If we didn't have a config file passed in from command line,
- // then give it a default:
+ // then use a default:
  if (strlen(configFile) == 0)
  {
   sprintf(configFile, "/etc/thermostat/.config\0");
@@ -155,45 +223,59 @@ int readConfigFile(void)
      // default variables accordingly:
      if (strcmp(LeftSide, "MORNINGSTART") == 0)
      {
+      // We expect the start times to come in as HH:MM.
+      // Convert this to an integer value, expressed in minutes:
+      morningStart = _convertTimeToInteger(RightSide);
      }
 
      if (strcmp(LeftSide, "AFTERNOONSTART") == 0)
      {
+      afternoonStart = _convertTimeToInteger(RightSide);
      }
 
      if (strcmp(LeftSide, "NIGHTSTART") == 0)
      {
+      nightStart = _convertTimeToInteger(RightSide);
      }
 
      if (strcmp(LeftSide, "MORNINGTEMP") == 0)
      {
+      morningTemp = atoi(RightSide);
+      if (morningTemp > 100) morningTemp = -1;
      }
 
      if (strcmp(LeftSide, "AFTERNOONTEMP") == 0)
      {
+      afternoonTemp = atoi(RightSide);
+      if (afternoonTemp > 100) afternoonTemp = -1;
      }
 
      if (strcmp(LeftSide, "NIGHTTEMP") == 0)
      {
+      nightTemp = atoi(RightSide);
+      if (nightTemp > 100) nightTemp = -1;
      }
 
      if (strcmp(LeftSide, "DEFAULTURL") == 0)
      {
+      sprintf(defaultURL, "%s\0", RightSide);
      }
-
 
    } // Endif (Not a Comment)
 
   } // End while (!feof)
 
-  OptionsFile->close();
+  fclose(aFile);
 
  } // Endif (File opened OK)
  else
  {
-  return -1; // Somethig wrong with the config file.
-             // inform main() and exit the program.
+  return CONFIG_ERR; // Somethig wrong with the config file.
+                     // inform main() and exit the program.
  }
+
+ if ((morningStart == -1) || (afternoonStart == -1) || (nightStart == -1)) return TIME_ERR;
+ if ((morningTemp == -1) || (afternoonTemp = -1) || (nightTemp == -1)) return TEMP_ERR;
 
  return 0; // Indicate no errors
 
@@ -209,6 +291,7 @@ int main(int argc, char* argv[])
  int x;
  char* theURL;
  int theAction = Action_UNKNOWN;
+ int ret;
 
  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  // DAEMON SETUP STUFF:
@@ -274,15 +357,20 @@ int main(int argc, char* argv[])
 
  } // Endif (argc >= 2)
 
+ // User requested help - show help screen and get out.
  if (theAction == Action_HELP)
  {
   performHelp();
   return OK;
  }
 
- readConfigFile();
+ // Read the config file.  Get out if we have an error.
+ if ((ret = readConfigFile()) < 0) return ret;
 
+ // Everything checks out - start heating the room!
  runThermostat();
 
+ // In theory, we should never reach this line of code.
  return OK;
+
 } // End Function main()
