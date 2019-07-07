@@ -12,6 +12,8 @@
 #include <curl/curl.h>
 
 #define OK         0
+#define OFF        0
+#define ON         1
 #define INIT_ERR   -1
 #define REQ_ERR    -2
 #define CONFIG_ERR -3
@@ -28,15 +30,20 @@
 char defaultURL[100];
 
 // This is a holdover from homework.c.  We'll still use GET, PUT and HELP for this program.
-int Action;
 typedef enum
 {
  Action_GET,
  Action_PUT,
  Action_POST,
  Action_DELETE,
- Action_HELP
+ Action_HELP,
+ Action_UNKNOWN
 } Actions;
+
+int theAction = Action_UNKNOWN;
+
+CURL* curl;
+CURLcode res;
 
 // Integers to hold programming start times:
 int morningStart, afternoonStart, nightStart;
@@ -47,11 +54,14 @@ int morningTemp, afternoonTemp, nightTemp;
 // current Time and Temperature: (505) 247-1611 for the Burquenos
 int currTime, currTemp;
 
+int heaterStatus; // Will be either OFF or ON
+
 #define CONFIG_FILENAME_LENGTH 1000
 char configFile[CONFIG_FILENAME_LENGTH];
 
 
 //*****************************************************************************
+// Allow the program to be stopped gracefully
 //*****************************************************************************
 static void _signal_handler(const int signal)
 {
@@ -71,8 +81,9 @@ static void _signal_handler(const int signal)
 } // End Function _signal_handler()
 
 
-/*****************************************************************************/
-/*****************************************************************************/
+//*****************************************************************************
+// Convert any lowercase letters in a string into upppercase
+//*****************************************************************************
 void _uppercase(char* lowercase)
 {
  int x, len;
@@ -99,27 +110,16 @@ int _convertTimeToInteger(char* aTime)
  char Hour[3];
  char Minute[3];
  int ret;
- int x, len, colon;
+ int x, len;
 
  len = strlen(aTime);
 
  if (len != 5) return -1; // if aTime isn't the right length, get out.
 
- // Find the location of the colon:
- colon = -1;
- for (x = 0; x < len; x++)
- {
-  if (aTime[x] == ':')
-  {
-   colon = x;
-   break;
-  }
- } // End For (x to len)
-
  // HH:MM
  // 01234
 
- if (colon != 2) return -1; // If colon is not where we expect it, get out.
+ if (aTime[2] != ':') return -1; // If colon is not where we expect it, get out.
 
  if (isDigit(aTime[0]) == 0) return -1; // If any of the parts of
  if (isDigit(aTime[1]) == 0) return -1; // HH or MM are non-numeric
@@ -145,7 +145,7 @@ int _convertTimeToInteger(char* aTime)
 
  return ret;
 
-} // End Function _convertToInteger()
+} // End Function _convertTimeToInteger()
 
 
 //*****************************************************************************
@@ -277,27 +277,156 @@ int readConfigFile(void)
  if ((morningStart == -1) || (afternoonStart == -1) || (nightStart == -1)) return TIME_ERR;
  if ((morningTemp == -1) || (afternoonTemp = -1) || (nightTemp == -1)) return TEMP_ERR;
 
+ // Do we care if morningStart < afternoonStart < nightStart ?
+ // Do we care if there's time between nightStart and Midnight?
+ // How about time between Midnight and morningStart?
+
  return 0; // Indicate no errors
 
 } // End Function readConfigFile()
 
 
 //*****************************************************************************
+// Read the current temperature from the input file /var/log/temperature.
+// Assume contents of the file are simply numeric, and represent the current
+// temperature.  Allow up to 3 digits for the value. Allow negative values.
+//*****************************************************************************
+int getCurrentTemperature(void)
+{
+ char currTemp[4];
+ int idx, x;
+ FILE* inputFile;
+ char inFileName[] = "/var/log/temperature";
+
+ inputFile = fopen(inFileName, "rb");
+ if (inputFile)
+ {
+  memset(currTemp, '\0', sizeof(currTemp));
+  idx = 0;
+  while ((!feof(inputFile)) && (idx < 3))
+  {
+   currTemp[idx++] = fgetc(inputFile);
+  }
+
+  fclose(inputFile);
+
+ } // Endif (inputFile opened OK)
+ else
+ {
+  return -1;
+ }
+
+ for (x = 0; x < idx; x++)
+ {
+  // Return an error for anything non-numeric.  Allow negative numbers.
+  if ((isDigit(currTemp[x]) == 0) && (currTemp[x] != '-')) return -1;
+ }
+
+ return atoi(currTemp);
+
+} // End Function getCurrentTemperature()
+
+
+//*****************************************************************************
+// Compare current heaterStatus to parameter OnOff.  If there's a change,
+// write the change and the time it happened to the output file.
+//*****************************************************************************
+void toggleHeater(int OnOff, int currTemp)
+{
+ FILE* outputFile;
+ char outFileName[] = "/var/log/heater";
+ time_t T;
+
+ if (heaterStatus != OnOff) // Only do something if there's a change.
+ {
+  heaterStatus = OnOff; // Change the status
+
+  // Open file for append.  Create if it doesn't exist yet.
+  outputFile = fopen(outFileName, "ab+");
+  if (outputFile)
+  {
+   T = time(NULL);
+   // Program requirements only asked for ON/OFF with the posix timestamp.
+   fprintf(outputFile, "%s : %ld\r\n", ((OnOff == ON) ? "ON":"OFF"), T);
+   fclose(outputFile);
+  } // Endif (outputFile opened OK)
+
+  // Log the change to /var/log/messages, just for good measure. Include
+  // current temperature.  syslog automatically adds the timestamp.
+  syslog(LOG_INFO, "Current temperature [%d], turning heater [%s]", currTemp, ((OnOff == ON) ? "ON":"OFF"));
+
+  // Need something here to update HTTP file.
+
+ } // Endif (heaterStatus != OnOff)
+
+} // End Function toggleHeater()
+
+
+//*****************************************************************************
+// Infinite while loop to check current temperature, and compare it against
+// our desired temperatures for the given time ranges.
+//*****************************************************************************
+void runTheromostat(void)
+{
+ char timestamp[6];
+ time_t T;
+ int currTemp;
+ int currTime;
+ int idx;
+
+ heaterStatus = OFF; // Gotta start somewhere...
+
+ while (1) // Run forever.
+ {
+  currTemp = getCurrentTemperature();
+
+  // Need something here to check HTTP for updates to start times/temps
+
+  if (currTemp > 0)
+  {
+   T = time(NULL);
+   struct tm tm = *localtime(&T);
+
+   sprintf(timestamp, "%02d:%02d\0", tm.tm_hour, tm.tm_min);
+   currTime = _convertTimeToInteger(timestamp);
+
+   // Check if we're in the 'morning' time range
+   if ((currTime >= morningStart) && (currTime < afternoonStart))
+   {
+    toggleHeater(((currTemp >= morningTemp) ? OFF:ON), currTemp);
+   }
+   // Or we're in the 'afternoon' time range
+   else if ((currTime >= afternoonStart) && (currTime < nightStart))
+   {
+    toggleHeater(((currTemp >= afternoonTemp) ? OFF:ON), currTemp);
+   }
+   // Change in logic to allow transition through midnight for 'night' time
+   else if ((currTime >= nightStart) || (currTime < morningStart))
+   {
+    toggleHeater(((currTemp >= nightTemp) ? OFF:ON), currTemp);
+   }
+
+  } // Endif (currTemp > 0)
+
+  sleep(15); // Wait 15 seconds before checking again.
+
+ } // End while (1)
+
+} // End Function runThermostat()
+
+
+//*****************************************************************************
 //*****************************************************************************
 int main(int argc, char* argv[])
 {
- CURL* curl;
- CURLcode res;
  int x;
- char* theURL;
- int theAction = Action_UNKNOWN;
  int ret;
 
  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  // DAEMON SETUP STUFF:
  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  openlog(DAEMON_NAME, LOG_PID | LOG_NDELAY | LOG_NOWAIT, LOG_DAEMON);
- syslog(LOG_INFO, "Starting sampled...");
+ syslog(LOG_INFO, "Starting thermostat...");
 
  pid_t pid = fork();
  if (pid < 0) // General fork error - log it and get out
