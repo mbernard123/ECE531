@@ -184,6 +184,7 @@ char* handleSQL(void)
  int responseCode;
  char odoa[3];
  char myQuery[256];
+ int result;
 
  MYSQL_RES *res;
  MYSQL_ROW row;
@@ -201,7 +202,7 @@ char* handleSQL(void)
  else if (theAction == Action_GET)
  {
   sprintf(myQuery, "select * from WEEK6 where Path=\"%s\"\0", thePath);
-  if (mysql_query(conn, myQuery))
+  if (mysql_query(conn, myQuery)) // != 0
   {
    sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
    sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
@@ -214,30 +215,43 @@ char* handleSQL(void)
    row = mysql_fetch_row(res);
    sprintf(responseBody, "{\"status\":\"success\",\"data\":\"%s\"}\0", row[1]);
    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   mysql_free_result(res);
   }
-  // close connection
-  mysql_free_result(res);
  } // Endif (Action_GET)
- else if (theAction == Action_POST)
+ else if ((theAction == Action_POST) || (theAction == Action_PUT))
  {
-  sprintf(myQuery, "insert into WEEK6 (Path, JSON) values (%s, %s)\0", thePath, payload);
-  if (mysql_query(conn, myQuery))
+  if (theAction == Action_PUT) sprintf(myQuery, "update WEEK6 set JSON='%s' where Path='%s'\0", thePath, createPayload());
+  else if (theAction == Action_POST) sprintf(myQuery, "insert into WEEK6 (Path, JSON) values (%s, %s)\0", thePath, createPayload());
+  result = mysql_query(conn, myQuery);
+  if (result != 0)
   {
-   sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
-   sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
-   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   if (theAction == Action_PUT) // Update failed, try again with insert
+   {
+    sprintf(myQuery, "insert into WEEK6 (Path, JSON) values (%s, %s)\0", thePath, createPayload());
+    result = mysql_query(conn, myQuery);
+   }
+   if (result != 0) // Still have an error from either PUT or POST
+   {
+    sprintf(responseHeader, "HTTP/1.1 500 Internal Server Error\0");
+    sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
+    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   }
   }
-  else
+  if (result == 0)
   {
    sprintf(responseHeader, "HTTP/1.1 200 OK\0");
    res = mysql_use_result(conn);
    row = mysql_fetch_row(res);
    sprintf(responseBody, "{\"status\":\"success\",\"key\":\"%s\"}\0", thePath);
    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   mysql_free_result(res);
   }
-  // close connection
-  mysql_free_result(res);
- } // Endif (Action_GET)
+ } // Endif (Action_POST) || (Action_PUT)
+ else if (theAction == Action_DELETE)
+ {
+  sprintf(myQuery, "insert into WEEK6 (Path, JSON) values (%s, %s)\0", thePath, createPayload());
+
+ } // Endif (Action_DELETE)
 
 
 
