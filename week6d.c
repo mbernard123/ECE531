@@ -1,14 +1,14 @@
-/***************************************************************************/
-/*                                                                         */
-/* Server program which wait for the client to connect and reads the data  */
-/*     using non-blocking socket.                                          */
-/* The reading of non-blocking sockets is done in a loop until data        */
-/*     arrives to the sockfd.                                              */
-/*                                                                         */
-/* based on Beej's program - look in the simple TCP server for further doc.*/
-/*                                                                         */
-/*                                                                         */
-/***************************************************************************/
+//***************************************************************************
+//
+// based on Beej's program - look in the simple TCP server for further doc.
+//
+// MUST be compiled and linked in two separate steps to get mySQL working:
+// Syntax is EXACTLY as stated below. mysql_config is a literal "mysql_config"
+//
+// $ gcc -c `mysql_config --cflags` progname.c
+// $ gcc -o progname progname.o `mysql_config --libs`
+//
+//***************************************************************************
 
 
 #include <stdio.h>
@@ -25,7 +25,7 @@
 #include <netdb.h>
 #include <sys/time.h>
 
-#include <mysql.h>
+#include "mysql/include/mysql.h"
 
 #include <signal.h>
 #include <sys/stat.h>
@@ -179,7 +179,7 @@ char* handleSQL(void)
  char responseContentLength[256]; // "Content-Length: XX"
  char* responseServerID = "Acronym to live by: RDWHAHB";
  char* responseContentType = "Content-Type: application/json";
- char responseBody[4096]
+ char responseBody[4096];
  static char fullResponse[4096];
  int responseCode;
  char odoa[3];
@@ -193,10 +193,13 @@ char* handleSQL(void)
  odoa[1] = 0x0A;
  odoa[2] = 0x00;
 
- if (strcmp(thePath, "/")) // Empty path specified...
+ if ((strcmp(thePath, "/")) || (strstr(thePath, "*") != 0)) // Empty path specified, or wildcard included.
  {
   sprintf(responseHeader, "HTTP/1.1 403 Forbidden\0");
-  sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"No Path Specified\"}\0");
+  if (strstr(thePath, "*") != 0)
+      sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Dude, Wildcards Not Allowed!\"}\0");
+  else
+      sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"No Path Specified\"}\0");
   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
  }
  else if (theAction == Action_GET)
@@ -249,10 +252,26 @@ char* handleSQL(void)
  } // Endif (Action_POST) || (Action_PUT)
  else if (theAction == Action_DELETE)
  {
-  sprintf(myQuery, "insert into WEEK6 (Path, JSON) values (%s, %s)\0", thePath, createPayload());
+  // We've already handled an empty path condition, so this *SHOULD* be safe.
+  sprintf(myQuery, "delete from WEEK6 where Path='%s'\0", thePath);
+  if (mysql_query(conn, myQuery)) // != 0
+  {
+   sprintf(responseHeader, "HTTP/1.1 500 Internal Server Error\0");
+   sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
+   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+  }
+  else
+  {
+   sprintf(responseHeader, "HTTP/1.1 200 OK\0");
+   res = mysql_use_result(conn);
+   row = mysql_fetch_row(res);
+   sprintf(responseBody, "{\"status\":\"success\",\"information\":\"data deleted\"}\0");
+   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   mysql_free_result(res);
+  }
+
 
  } // Endif (Action_DELETE)
-
 
 
  sprintf(fullResponse, "%s%s%s%s%s%s%s%s%s%s\0",
@@ -348,6 +367,8 @@ void processRequest(char* data, int len)
 
  idx = 0;
  x = 0;
+ stringCount = 0;
+
  while (x < (len-2))
  {
   memset(aHeaderLine, '\0', sizeof(aHeaderLine));
@@ -411,7 +432,7 @@ void processRequest(char* data, int len)
    theAction = Action_DELETE;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
-  else if ((strlen(stringList[x] == 0)) && (payloadStartingLine < 0))
+  else if ((strlen(stringList[x]) == 0) && (payloadStartingLine < 0))
   {
    // Each of the stringList lines terminates with a newline.  HTTP convention
    // is that a blank line inidcates the next line is the payload data.
@@ -561,7 +582,7 @@ int main(void)
 
  if ((ret = _demon_stuff()) <= 0) return ret;
 
- if ((ret = initSQL) < 0) return ret;
+ if ((ret = initSQL()) < 0) return ret;
 
  if ((ret = setupServer()) < 0) return ret;
 
