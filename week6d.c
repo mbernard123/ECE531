@@ -5,8 +5,11 @@
 // MUST be compiled and linked in two separate steps to get mySQL working:
 // Syntax is EXACTLY as stated below. mysql_config is a literal "mysql_config"
 //
+// Tick marks surrounding `mysql_config` are backticks (under the tilde)
+//
 // $ gcc -c `mysql_config --cflags` progname.c
 // $ gcc -o progname progname.o `mysql_config --libs`
+//
 //
 //***************************************************************************
 
@@ -148,6 +151,84 @@ int _demon_stuff(void)
 
 
 //***************************************************************************
+// Payload may come in as multiple lines, starting at 'payloadStartingLine'.
+// Combine them into a single string.
+//***************************************************************************
+char* createPayload(void)
+{
+ char combined[4096];
+ static char ret[4096];
+ int x, idx, len, currline;
+
+ idx = 0;
+ memset(combined, '\0', sizeof(combined));
+
+ // stringCount == 8, payloadStartingLine = 7
+ currline = payloadStartingLine; // 7
+ while (currline < stringCount) // Make sure we have at least one payload line
+ {
+
+  len = strlen(stringList[currline]);
+  for (x = 0; x < len; x++)
+  {
+   combined[idx++] = stringList[currline][x];
+  } // End For (x to len)
+
+  if (currline < (stringCount-1)) // if this isn't the very last line...
+  {
+   combined[idx++] = 0x0D;
+   combined[idx++] = 0x0A;
+  }
+
+  currline++;
+ } // End while (currline < stringCount)
+
+ memset(ret, '\0', sizeof(ret));
+ memcpy(ret, combined, idx);
+
+ return ret;
+
+} // End Function createPayload()
+
+
+//***************************************************************************
+// designed to "escape" things like forward slashes and quotation marks
+// by doubling them up (turning " into "", or turning / into //). SQL will
+// recognize to actually put a quotation mark (or slash) into the data stream.
+//***************************************************************************
+char* doubleUp(char* raw, int replace)
+{
+ char combined[4096];
+ static char ret[4096];
+ int x, idx, len;
+
+ idx = 0;
+ memset(combined, '\0', sizeof(combined));
+
+  len = strlen(raw);
+  for (x = 0; x < len; x++)
+  {
+   if (raw[x] == replace)
+   {
+    combined[idx++] = replace;
+    combined[idx++] = replace;
+   }
+   else
+   {
+    combined[idx++] = raw[x];
+   }
+
+  } // End For (x to len)
+
+ memset(ret, '\0', sizeof(ret));
+ memcpy(ret, combined, idx);
+
+ return ret;
+
+} // End Function doubleUp()
+
+
+//***************************************************************************
 // Set up the connection the the SQL database.  It is critical that the
 // mySQL demon is running at the same time as this program.
 //***************************************************************************
@@ -185,26 +266,66 @@ char* handleSQL(void)
  char odoa[3];
  char myQuery[256];
  int result;
+ char usePath[4096];
+ char usePayload[4096];
+ int shouldContinue = 0;
+ char debug[256];
+ int tempint;
 
- MYSQL_RES *res;
- MYSQL_ROW row;
+ MYSQL_RES*   res;
+ MYSQL_ROW    row;
+ MYSQL_FIELD* mysqlFields;
+ unsigned long numRows;
+ unsigned int numFields;
+
 
  odoa[0] = 0x0D;
  odoa[1] = 0x0A;
  odoa[2] = 0x00;
 
- if ((strcmp(thePath, "/")) || (strstr(thePath, "*") != 0)) // Empty path specified, or wildcard included.
+
+ if (((theAction == Action_GET) || (theAction == Action_DELETE)) && (strlen(thePath) > 0))
  {
-  sprintf(responseHeader, "HTTP/1.1 403 Forbidden\0");
-  if (strstr(thePath, "*") != 0)
-      sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Dude, Wildcards Not Allowed!\"}\0");
-  else
-      sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"No Path Specified\"}\0");
+  shouldContinue = 1;
+ }
+ else if (((theAction == Action_PUT) || (theAction == Action_POST)) && (strlen(thePath) > 0) && (payloadStartingLine > 0))
+ {
+  shouldContinue = 1;
+ }
+ else
+ {
+  shouldContinue = 0;
+  sprintf(responseHeader, "HTTP/1.1 400 Bad Request\0");
+  sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Insufficient Data (no payload)\"}\0");
   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
  }
- else if (theAction == Action_GET)
+
+
+
+ if (shouldContinue == 1)
  {
-  sprintf(myQuery, "select * from WEEK6 where Path=\"%s\"\0", thePath);
+
+ //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ if ((strcmp(thePath, "/")) && (strlen(thePath) == 1)) // Empty path specified
+ {
+  sprintf(responseHeader, "HTTP/1.1 403 Forbidden\0");
+  sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"No Path Specified\"}\0");
+  sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+ }
+ //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ else if (strstr(thePath, "*") != 0) // wildcard included in path.
+ {
+  sprintf(responseHeader, "HTTP/1.1 403 Forbidden\0");
+  sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Wildcards Not Allowed!\"}\0");
+  sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+ }
+ //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ else if (theAction == Action_GET) // User wants to GET existing data.
+ {
+  numRows = 0;
+  sprintf(myQuery, "select * from WEEK6 where Path='%s'\0", thePath);
+  fprintf(stdout, "--> [%s]\n", myQuery); // DEBUG ONLY
+
   if (mysql_query(conn, myQuery)) // != 0
   {
    sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
@@ -213,18 +334,44 @@ char* handleSQL(void)
   }
   else
   {
-   sprintf(responseHeader, "HTTP/1.1 200 OK\0");
-   res = mysql_use_result(conn);
-   row = mysql_fetch_row(res);
-   sprintf(responseBody, "{\"status\":\"success\",\"data\":\"%s\"}\0", row[1]);
-   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
-   mysql_free_result(res);
-  }
+   res = mysql_store_result(conn); // Get the Result Set
+   if (res)  // Query was successful.  Do we have any rows in the result?
+   {
+    numRows = mysql_num_rows(res);
+    numFields = mysql_num_fields(res);
+   }
+   else
+   {
+    fprintf(stdout, "Result set is empty");
+   }
+
+   if (numRows <= 0)
+   {
+    sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
+    sprintf(responseBody, "{\"status\":\"failure\",\"data\":\"Not Found (%d)\"}\0", mysql_errno(conn));
+    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   }
+   else
+   {
+    fprintf(stdout, "We have %d rows with %d fields\n", numRows, numFields);
+    row = mysql_fetch_row(res);
+    sprintf(responseHeader, "HTTP/1.1 200 OK\0");
+    sprintf(responseBody, "{\"status\":\"success\",\"data\":\"%s\"}\0", row[1]);
+    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   }
+
+   if (res) mysql_free_result(res);
+
+  } // End else (myQuery succeeded)
+
  } // Endif (Action_GET)
- else if ((theAction == Action_POST) || (theAction == Action_PUT))
+ //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ else if ((theAction == Action_POST) || (theAction == Action_PUT)) // User wants to update or submit data.
  {
-  if (theAction == Action_PUT) sprintf(myQuery, "update WEEK6 set JSON='%s' where Path='%s'\0", thePath, createPayload());
-  else if (theAction == Action_POST) sprintf(myQuery, "insert into WEEK6 (Path, JSON) values (%s, %s)\0", thePath, createPayload());
+  fprintf(stdout, "--> building myQuery\n"); // Debug Only
+  if (theAction == Action_PUT) sprintf(myQuery, "update WEEK6 set JSON='%s' where Path='%s'\0", createPayload(), thePath);
+  else if (theAction == Action_POST) sprintf(myQuery, "insert into WEEK6 (Path, JSON) values ('%s', '%s')\0", thePath, createPayload());
+  fprintf(stdout, "--> [%s]\n", myQuery); // Debug Only
   result = mysql_query(conn, myQuery);
   if (result != 0)
   {
@@ -244,15 +391,17 @@ char* handleSQL(void)
   {
    sprintf(responseHeader, "HTTP/1.1 200 OK\0");
    res = mysql_use_result(conn);
-   row = mysql_fetch_row(res);
+   //row = mysql_fetch_row(res);
    sprintf(responseBody, "{\"status\":\"success\",\"key\":\"%s\"}\0", thePath);
    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
    mysql_free_result(res);
   }
  } // Endif (Action_POST) || (Action_PUT)
- else if (theAction == Action_DELETE)
+ //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ else if (theAction == Action_DELETE) // User wants to delete data.
  {
   // We've already handled an empty path condition, so this *SHOULD* be safe.
+  //sprintf(usePath, "%s\0", doubleUp(thePath, 0x2F));
   sprintf(myQuery, "delete from WEEK6 where Path='%s'\0", thePath);
   if (mysql_query(conn, myQuery)) // != 0
   {
@@ -262,16 +411,23 @@ char* handleSQL(void)
   }
   else
   {
-   sprintf(responseHeader, "HTTP/1.1 200 OK\0");
-   res = mysql_use_result(conn);
-   row = mysql_fetch_row(res);
-   sprintf(responseBody, "{\"status\":\"success\",\"information\":\"data deleted\"}\0");
-   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
-   mysql_free_result(res);
+   unsigned long affectedRows= mysql_affected_rows(conn);
+   if (affectedRows > 0)
+   {
+    sprintf(responseHeader, "HTTP/1.1 200 OK\0");
+    sprintf(responseBody, "{\"status\":\"success\",\"information\":\"data deleted\"}\0");
+    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   }
+   else
+   {
+    sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
+    sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Not Found (%d)\"}\0", mysql_errno(conn));
+    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   }
   }
-
-
  } // Endif (Action_DELETE)
+
+ } // Endif (shouldContinue == 1)
 
 
  sprintf(fullResponse, "%s%s%s%s%s%s%s%s%s%s\0",
@@ -280,7 +436,11 @@ char* handleSQL(void)
                          responseContentType, odoa,
                          responseContentLength, odoa,
                          odoa, responseBody);
+
+ fprintf(stdout, "%s\n", fullResponse); // Debug Only
+
  return fullResponse;
+
 
 
 } // End Function handleSQL()
@@ -391,6 +551,7 @@ void processRequest(char* data, int len)
 
   if (haveNewline == 0) // This will probably be the payload line, but we need
   {                     // to check that the stringList line before it is blank
+   aHeaderLine[y++] = data[x];
    aHeaderLine[y++] = data[x+1];
    memset(stringList[stringCount], '\0', sizeof(stringList[stringCount]));
    memcpy(stringList[stringCount], aHeaderLine, y);
@@ -405,6 +566,12 @@ void processRequest(char* data, int len)
 
  } // End while (x < len-2)
 
+ for (x = 0; x < stringCount; x++)
+ {
+  fprintf(stdout, "%d = [%s], %d\n", x, stringList[x], strlen(stringList[x]));
+ }
+
+
  theAction = Action_UNKNOWN;
  payloadStartingLine = -1;
  memset(thePath, '\0', sizeof(thePath));
@@ -414,21 +581,25 @@ void processRequest(char* data, int len)
 
   if ((strstr(stringList[x], "GET ") != 0) && (theAction == Action_UNKNOWN))
   {
+   fprintf(stdout, "incoming action is GET\n"); // Debug Only
    theAction = Action_GET;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
   else if ((strstr(stringList[x], "PUT ") != 0) && (theAction == Action_UNKNOWN))
   {
+   fprintf(stdout, "incoming action is PUT\n"); // Debug Only
    theAction = Action_PUT;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
   else if ((strstr(stringList[x], "POST ") != 0) && (theAction == Action_UNKNOWN))
   {
+   fprintf(stdout, "incoming action is POST\n"); // Debug Only
    theAction = Action_POST;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
   else if ((strstr(stringList[x], "DELETE ") != 0) && (theAction == Action_UNKNOWN))
   {
+   fprintf(stdout, "incoming action is DELETE\n"); // Debug Only
    theAction = Action_DELETE;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
@@ -442,6 +613,10 @@ void processRequest(char* data, int len)
   if ((theAction != Action_UNKNOWN) && (payloadStartingLine > 0)) break;
 
  } // End for (x to stringCount)
+
+ fprintf(stdout, "incoming path is [%s]\n", thePath); // Debug Only
+ fprintf(stdout, "payload starts at line [%d]\n", payloadStartingLine); // Debug Only
+
 
 } // End Function processRequest()
 
@@ -550,13 +725,8 @@ int pollServer(void)
    {
     processRequest(buf, nbytes);
 
-    if ((payloadStartingLine > 0) && (theAction != Action_UNKNOWN) && (strlen(thePath) > 0))
-    {
-     sprintf(resp, "%s\0", handleSQL()); // resp will be a fully-formed HTTP 200,
-    }
-
-    // Use what's returned from handleSQL()
-    //sprintf(resp, "HTTP/1.1 200 OK\r\n\r\nAll good, dude.\n\0");
+    fprintf(stdout, "call handleSQL\n"); // Debug Only
+    sprintf(resp, "%s\0", handleSQL()); // resp will be a fully-formed HTTP 200, etc
 
     send(new_fd, resp, strlen(resp), 0);
     close(new_fd); // bye!
@@ -580,7 +750,7 @@ int main(void)
 {
  int ret;
 
- if ((ret = _demon_stuff()) <= 0) return ret;
+ //if ((ret = _demon_stuff()) <= 0) return ret;
 
  if ((ret = initSQL()) < 0) return ret;
 
