@@ -1,15 +1,23 @@
 //***************************************************************************
-//
-// based on Beej's program - look in the simple TCP server for further doc.
+// WEEK6.C - homework assignment for Week 6, ECE531, Summer 2019
+// Marc Bernard
 //
 // MUST be compiled and linked in two separate steps to get mySQL working:
 // Syntax is EXACTLY as stated below. mysql_config is a literal "mysql_config"
-//
 // Tick marks surrounding `mysql_config` are backticks (under the tilde)
-//
 // $ gcc -c `mysql_config --cflags` progname.c
 // $ gcc -o progname progname.o `mysql_config --libs`
 //
+// Socket/webserver portion was developed by me.  There will be bugs, there
+// will be exploitable areas, there will be security loopholes.
+// Attempts to mitigate this are included in handleSQL().
+//
+// This program requires the mySQL service to be running at the same time.
+// Run the following command before kicking off this program:
+// $ sudo service mysql start
+//
+// This program is designed to run on AWS, which only allows port 80 for
+// HTTP connections.  You must run this program with sudo.
 //
 //***************************************************************************
 
@@ -37,21 +45,19 @@
 #define MYPORT 80    /* the port users will be connecting to */
 #define BACKLOG 10     /* how many pending connections queue will hold */
 
-#define DAEMON_NAME "timekeeperd"
+#define DAEMON_NAME "week6d"
 #define OK 0
 #define ERR_FORK -1
 #define ERR_SETSID -2
 #define ERR_CHDIR -3
 
-int                     sockfd, new_fd;  /* listen on sock_fd, new connection on new_fd */
-struct  sockaddr_in     my_addr;    /* my address information */
-struct  sockaddr_in*    their_addr; /* connector's address information */
-struct  sockaddr        temp_addr;
-int                     sin_size;
-char                    string_read[255];
-int                     n,i, j;
-int                     last_fd;        /* Thelast sockfd that is connected     */
-unsigned int            opt = 1;
+int                  sockfd, new_fd;  /* listen on sock_fd, new connection on new_fd */
+struct  sockaddr_in  my_addr;    /* my address information */
+struct  sockaddr_in* their_addr; /* connector's address information */
+struct  sockaddr     temp_addr;
+int                  sin_size;
+//int                  n,i,j;
+unsigned int         opt = 1;
 fd_set master;    // master file descriptor list
 fd_set read_fds;  // temp file descriptor list for select()
 int fdmax;        // maximum file descriptor number
@@ -83,6 +89,26 @@ char *sql_user = "root";
 char *sql_password = "";
 char *sql_database = "ECE531";
 
+int demonized = 0;
+int responseCount = 0;
+
+//*****************************************************************************
+// Direct trace statements to either stdout, or syslog, depending on where
+// we're running.
+//*****************************************************************************
+void SAY(char* s, ...)
+{
+ char _buffer[4096];
+
+  va_list ap;
+  va_start(ap, s);
+  vsprintf(_buffer, s, ap);
+
+  if (demonized == 1) syslog(LOG_INFO, _buffer);
+  else fprintf(stdout, "%s\n", _buffer);
+
+} // End Function SAY()
+
 
 //*****************************************************************************
 //*****************************************************************************
@@ -108,25 +134,27 @@ static void _signal_handler(const int signal)
 //***************************************************************************
 int _demon_stuff(void)
 {
+ demonized = 1;
+
  openlog(DAEMON_NAME, LOG_PID | LOG_NDELAY | LOG_NOWAIT, LOG_DAEMON);
- syslog(LOG_INFO, "Starting week6d...");
+ SAY("Starting week6d...");
 
  pid_t pid = fork();
  if (pid < 0) // General fork error - log it and get out
  {
-  syslog(LOG_ERR, "Error Attempting fork(%s)\n", strerror(errno));
+  SAY("Error Attempting fork(%s)\n", strerror(errno));
   return ERR_FORK;
  }
  if (pid > 0) // Parent process gets a PID > 0.  We want to be the child.
  {
   // Not really an error, but we don't want to be the parent.
-  // return a negative value so this process will end.
+  // return a zero value so this process will end.
   return OK;
  }
 
  if (setsid() < -1)
  {
-  syslog(LOG_ERR, "Error attempting setsid(%s)\n", strerror(errno));
+  SAY("Error attempting setsid(%s)\n", strerror(errno));
   return ERR_SETSID;
  }
 
@@ -138,7 +166,7 @@ int _demon_stuff(void)
 
  if (chdir("/") < 0)
  {
-  syslog(LOG_ERR, "Error attempting chdir(%s)\n", strerror(errno));
+  SAY("Error attempting chdir(%s)\n", strerror(errno));
   return ERR_CHDIR;
  }
 
@@ -174,14 +202,16 @@ char* createPayload(void)
    combined[idx++] = stringList[currline][x];
   } // End For (x to len)
 
-  if (currline < (stringCount-1)) // if this isn't the very last line...
-  {
-   combined[idx++] = 0x0D;
-   combined[idx++] = 0x0A;
-  }
+//  if (currline < (stringCount-1)) // if this isn't the very last line...
+//  {
+//   combined[idx++] = 0x0D;
+//   combined[idx++] = 0x0A;
+//  }
 
   currline++;
  } // End while (currline < stringCount)
+
+ SAY("   incoming payload [%s]", combined);
 
  memset(ret, '\0', sizeof(ret));
  memcpy(ret, combined, idx);
@@ -192,8 +222,8 @@ char* createPayload(void)
 
 
 //***************************************************************************
-// designed to "escape" things like forward slashes and quotation marks
-// by doubling them up (turning " into "", or turning / into //). SQL will
+// designed to "escape" things like forward slashes and quotation marks.
+// By doubling them up (turning " into "", or turning / into //), SQL will
 // recognize to actually put a quotation mark (or slash) into the data stream.
 //***************************************************************************
 char* doubleUp(char* raw, int replace)
@@ -240,7 +270,8 @@ int initSQL(void)
  if (!mysql_real_connect(conn, sql_server, sql_user,
      sql_password, sql_database, 0, NULL, 0))
  {
-  syslog(LOG_ERR, "SQL Connect Error (%s)\n", mysql_error(conn));
+  SAY("SQL Connect Error (%s)", mysql_error(conn));
+
   return -1;
  }
 
@@ -248,6 +279,63 @@ int initSQL(void)
 
 } // End Function initSQL()
 
+
+//***************************************************************************
+//***************************************************************************
+char* badServerID(void)
+{
+ static char RetVal[256];
+ char temp[256];
+ memset(temp, '\0', sizeof(temp));
+
+ responseCount++;
+ if (responseCount > 9) responseCount = 0;
+
+ if (responseCount == 0) sprintf(temp, "Keep Trying.");
+ if (responseCount == 1) sprintf(temp, "Not quite what I had in mind.");
+ if (responseCount == 2) sprintf(temp, "You're new at this, aren't you?");
+ if (responseCount == 3) sprintf(temp, "You call yourself a hacker?");
+ if (responseCount == 4) sprintf(temp, "Well at least take me to dinner first.");
+ if (responseCount == 5) sprintf(temp, "Hehe, that tickles.");
+ if (responseCount == 6) sprintf(temp, "Don't worry, it happens to everyone.");
+ if (responseCount == 7) sprintf(temp, "Too bad, so sad.");
+ if (responseCount == 8) sprintf(temp, "I do not think it means what you think it means.");
+ if (responseCount == 9) sprintf(temp, "Just what exactly are you looking for?");
+
+ memset(RetVal, '\0', sizeof(RetVal));
+ sprintf(RetVal, "%s", temp);
+ return RetVal;
+
+} // End Funtion badServerID()
+
+
+//***************************************************************************
+//***************************************************************************
+char* goodServerID(void)
+{
+ static char RetVal[256];
+ char temp[256];
+
+ memset(temp, '\0', sizeof(temp));
+ responseCount++;
+ if (responseCount > 9) responseCount = 0;
+
+ if (responseCount == 0) sprintf(temp, "Ahh, that's the stuff.");
+ if (responseCount == 1) sprintf(temp, "Looks like you've read the manual.");
+ if (responseCount == 2) sprintf(temp, "IITYWYBMAD");
+ if (responseCount == 3) sprintf(temp, "List your top ten U2 songs - Go!");
+ if (responseCount == 4) sprintf(temp, "RDWHAHB");
+ if (responseCount == 5) sprintf(temp, "I learned VI for this assignment.");
+ if (responseCount == 6) sprintf(temp, "This space for rent.");
+ if (responseCount == 7) sprintf(temp, "I believe in a higher Bob.");
+ if (responseCount == 8) sprintf(temp, "Python? Bah, that's for people who don't know C.");
+ if (responseCount == 9) sprintf(temp, "There's only ten of these; they cycle from here.");
+
+ memset(RetVal, '\0', sizeof(RetVal));
+ sprintf(RetVal, "%s", temp);
+ return RetVal;
+
+} // End Function goodServerID()
 
 //***************************************************************************
 // Use theAction to update/retrieve from the SQL database.
@@ -258,7 +346,7 @@ char* handleSQL(void)
 {
  char responseHeader[256]; // "HTTP/1.1 XXX Reason"
  char responseContentLength[256]; // "Content-Length: XX"
- char* responseServerID = "Acronym to live by: RDWHAHB";
+ char responseServerID[256];
  char* responseContentType = "Content-Type: application/json";
  char responseBody[4096];
  static char fullResponse[4096];
@@ -266,24 +354,26 @@ char* handleSQL(void)
  char odoa[3];
  char myQuery[256];
  int result;
- char usePath[4096];
- char usePayload[4096];
+ //char usePath[4096];
+ //char usePayload[4096];
  int shouldContinue = 0;
  char debug[256];
  int tempint;
+ int goodOrBad = 0;
 
  MYSQL_RES*   res;
  MYSQL_ROW    row;
  MYSQL_FIELD* mysqlFields;
  unsigned long numRows;
  unsigned int numFields;
+ unsigned long affectedRows;
 
 
  odoa[0] = 0x0D;
  odoa[1] = 0x0A;
  odoa[2] = 0x00;
 
-
+ // Make sure we have all our necessary parts to perform an SQL query:
  if (((theAction == Action_GET) || (theAction == Action_DELETE)) && (strlen(thePath) > 0))
  {
   shouldContinue = 1;
@@ -296,10 +386,10 @@ char* handleSQL(void)
  {
   shouldContinue = 0;
   sprintf(responseHeader, "HTTP/1.1 400 Bad Request\0");
-  sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Insufficient Data (no payload)\"}\0");
+  sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Insufficient Data (no payload/no path/no verb)\"}\0");
   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+  goodOrBad = 0;
  }
-
 
 
  if (shouldContinue == 1)
@@ -311,6 +401,7 @@ char* handleSQL(void)
   sprintf(responseHeader, "HTTP/1.1 403 Forbidden\0");
   sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"No Path Specified\"}\0");
   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+  goodOrBad = 0;
  }
  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  else if (strstr(thePath, "*") != 0) // wildcard included in path.
@@ -318,19 +409,21 @@ char* handleSQL(void)
   sprintf(responseHeader, "HTTP/1.1 403 Forbidden\0");
   sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Wildcards Not Allowed!\"}\0");
   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+  goodOrBad = 0;
  }
  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  else if (theAction == Action_GET) // User wants to GET existing data.
  {
   numRows = 0;
   sprintf(myQuery, "select * from WEEK6 where Path='%s'\0", thePath);
-  fprintf(stdout, "--> [%s]\n", myQuery); // DEBUG ONLY
+  //fprintf(stdout, "--> [%s]\n", myQuery); // DEBUG ONLY
 
   if (mysql_query(conn, myQuery)) // != 0
   {
    sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
    sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   goodOrBad = 0;
   }
   else
   {
@@ -340,24 +433,22 @@ char* handleSQL(void)
     numRows = mysql_num_rows(res);
     numFields = mysql_num_fields(res);
    }
-   else
-   {
-    fprintf(stdout, "Result set is empty");
-   }
 
    if (numRows <= 0)
    {
     sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
-    sprintf(responseBody, "{\"status\":\"failure\",\"data\":\"Not Found (%d)\"}\0", mysql_errno(conn));
+    sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Not Found (%d)\"}\0", mysql_errno(conn));
     sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+    goodOrBad = 0;
    }
    else
    {
-    fprintf(stdout, "We have %d rows with %d fields\n", numRows, numFields);
+    //fprintf(stdout, "We have %d rows with %d fields\n", numRows, numFields);
     row = mysql_fetch_row(res);
     sprintf(responseHeader, "HTTP/1.1 200 OK\0");
     sprintf(responseBody, "{\"status\":\"success\",\"data\":\"%s\"}\0", row[1]);
     sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+    goodOrBad = 1;
    }
 
    if (res) mysql_free_result(res);
@@ -366,36 +457,84 @@ char* handleSQL(void)
 
  } // Endif (Action_GET)
  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
- else if ((theAction == Action_POST) || (theAction == Action_PUT)) // User wants to update or submit data.
+ else if ((theAction == Action_POST) || (theAction == Action_PUT)) // POST is used to create.  PUT can be either create or update.
  {
-  fprintf(stdout, "--> building myQuery\n"); // Debug Only
-  if (theAction == Action_PUT) sprintf(myQuery, "update WEEK6 set JSON='%s' where Path='%s'\0", createPayload(), thePath);
-  else if (theAction == Action_POST) sprintf(myQuery, "insert into WEEK6 (Path, JSON) values ('%s', '%s')\0", thePath, createPayload());
-  fprintf(stdout, "--> [%s]\n", myQuery); // Debug Only
+  if (theAction == Action_PUT)
+  {
+   sprintf(myQuery, "update WEEK6 set JSON='%s' where Path='%s'\0", createPayload(), thePath);
+  }
+  else if (theAction == Action_POST)
+  {
+   sprintf(myQuery, "insert into WEEK6 (Path, JSON) values ('%s', '%s')\0", thePath, createPayload());
+  }
+
   result = mysql_query(conn, myQuery);
+  affectedRows = mysql_affected_rows(conn);
+
   if (result != 0)
   {
-   if (theAction == Action_PUT) // Update failed, try again with insert
+   SAY("POST/PUT Query failed: %s", mysql_error(conn));
+
+    if (theAction == Action_PUT) // UPDATE failed, try again with INSERT
+    {
+     SAY("PUT failed as an 'update', attempting 'insert' instead");
+
+     sprintf(myQuery, "insert into WEEK6 (Path, JSON) values ('%s', '%s')\0", thePath, createPayload());
+     result = mysql_query(conn, myQuery);
+     if (result != 0) // Still have an error from either PUT or POST
+     {
+      SAY("PUT Query failed as insert: %s", mysql_error(conn));
+      sprintf(responseHeader, "HTTP/1.1 500 Internal Server Error\0");
+      sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
+      sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+      goodOrBad = 0;
+     }
+     else
+     {
+      affectedRows = mysql_affected_rows(conn);
+     }
+    } // Endif (2nd attempt with PUT as insert)
+    else if (theAction == Action_POST) // INSERT failed, try again with UPDATE
+    {
+     SAY("POST failed as an 'insert', attempting 'update' instead");
+
+     sprintf(myQuery, "update WEEK6 set JSON='%s' where Path='%s'\0", createPayload(), thePath);
+     result = mysql_query(conn, myQuery);
+     if (result != 0) // Still have an error from either PUT or POST
+     {
+      sprintf(responseHeader, "HTTP/1.1 500 Internal Server Error\0");
+      sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
+      sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+      goodOrBad = 0;
+     }
+     else
+     {
+      affectedRows = mysql_affected_rows(conn);
+     }
+    } // Endif (2nd attempt with POST as update)
+
+  } // Endif (result != 0)
+
+   if ((affectedRows > 0) && (result == 0))
    {
-    sprintf(myQuery, "insert into WEEK6 (Path, JSON) values (%s, %s)\0", thePath, createPayload());
-    result = mysql_query(conn, myQuery);
-   }
-   if (result != 0) // Still have an error from either PUT or POST
-   {
-    sprintf(responseHeader, "HTTP/1.1 500 Internal Server Error\0");
-    sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
+    SAY("POST/PUT Query Succeeded!");
+
+    sprintf(responseHeader, "HTTP/1.1 200 OK\0");
+    sprintf(responseBody, "{\"status\":\"success\",\"key\":\"%s\"}\0", thePath);
     sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+    goodOrBad = 1;
    }
-  }
-  if (result == 0)
-  {
-   sprintf(responseHeader, "HTTP/1.1 200 OK\0");
-   res = mysql_use_result(conn);
-   //row = mysql_fetch_row(res);
-   sprintf(responseBody, "{\"status\":\"success\",\"key\":\"%s\"}\0", thePath);
-   sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
-   mysql_free_result(res);
-  }
+   else
+   {
+    SAY("insert command failed for either PUT or POST, no action taken");
+
+    sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
+    sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Not Found (%d)\"}\0", mysql_errno(conn));
+    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+    goodOrBad = 0;
+   }
+
+
  } // Endif (Action_POST) || (Action_PUT)
  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  else if (theAction == Action_DELETE) // User wants to delete data.
@@ -408,27 +547,34 @@ char* handleSQL(void)
    sprintf(responseHeader, "HTTP/1.1 500 Internal Server Error\0");
    sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"%s\"}\0", mysql_error(conn));
    sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+   goodOrBad = 0;
   }
   else
   {
-   unsigned long affectedRows= mysql_affected_rows(conn);
+   affectedRows = mysql_affected_rows(conn);
    if (affectedRows > 0)
    {
     sprintf(responseHeader, "HTTP/1.1 200 OK\0");
     sprintf(responseBody, "{\"status\":\"success\",\"information\":\"data deleted\"}\0");
     sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+    goodOrBad = 1;
    }
    else
    {
     sprintf(responseHeader, "HTTP/1.1 404 Not Found\0");
     sprintf(responseBody, "{\"status\":\"failure\",\"reason\":\"Not Found (%d)\"}\0", mysql_errno(conn));
     sprintf(responseContentLength, "Content-Length: %d\0", strlen(responseBody));
+    goodOrBad = 0;
    }
   }
  } // Endif (Action_DELETE)
 
  } // Endif (shouldContinue == 1)
 
+
+ sprintf(responseServerID, "%s\0", (goodOrBad == 0) ? badServerID() : goodServerID());
+
+ if (demonized == 0) printf("responding with [%s]\n", responseServerID);
 
  sprintf(fullResponse, "%s%s%s%s%s%s%s%s%s%s\0",
                          responseHeader, odoa,
@@ -437,7 +583,7 @@ char* handleSQL(void)
                          responseContentLength, odoa,
                          odoa, responseBody);
 
- fprintf(stdout, "%s\n", fullResponse); // Debug Only
+ //fprintf(stdout, "%s\n", fullResponse); // Debug Only
 
  return fullResponse;
 
@@ -568,7 +714,9 @@ void processRequest(char* data, int len)
 
  for (x = 0; x < stringCount; x++)
  {
-  fprintf(stdout, "%d = [%s], %d\n", x, stringList[x], strlen(stringList[x]));
+  //fprintf(stdout, "%d = [%s], %d\n", x, stringList[x], strlen(stringList[x]));
+  if (demonized == 1) syslog(LOG_INFO, "%d = [%s]", x, stringList[x]);
+  else printf("%d = [%s]\n", x, stringList[x]);
  }
 
 
@@ -581,25 +729,29 @@ void processRequest(char* data, int len)
 
   if ((strstr(stringList[x], "GET ") != 0) && (theAction == Action_UNKNOWN))
   {
-   fprintf(stdout, "incoming action is GET\n"); // Debug Only
+   //fprintf(stdout, "incoming action is GET\n"); // Debug Only
+   SAY("   GET requested...");
    theAction = Action_GET;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
   else if ((strstr(stringList[x], "PUT ") != 0) && (theAction == Action_UNKNOWN))
   {
-   fprintf(stdout, "incoming action is PUT\n"); // Debug Only
+   //fprintf(stdout, "incoming action is PUT\n"); // Debug Only
+   SAY("   PUT requested...");
    theAction = Action_PUT;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
   else if ((strstr(stringList[x], "POST ") != 0) && (theAction == Action_UNKNOWN))
   {
-   fprintf(stdout, "incoming action is POST\n"); // Debug Only
+   //fprintf(stdout, "incoming action is POST\n"); // Debug Only
+   SAY("   POST requested...");
    theAction = Action_POST;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
   else if ((strstr(stringList[x], "DELETE ") != 0) && (theAction == Action_UNKNOWN))
   {
-   fprintf(stdout, "incoming action is DELETE\n"); // Debug Only
+   //fprintf(stdout, "incoming action is DELETE\n"); // Debug Only
+   SAY("   DELETE requested...");
    theAction = Action_DELETE;
    sprintf(thePath, "%s\0", getPath(stringList[x]));
   }
@@ -614,8 +766,10 @@ void processRequest(char* data, int len)
 
  } // End for (x to stringCount)
 
- fprintf(stdout, "incoming path is [%s]\n", thePath); // Debug Only
- fprintf(stdout, "payload starts at line [%d]\n", payloadStartingLine); // Debug Only
+ SAY("   Desired path is [%s]", thePath);
+
+ //fprintf(stdout, "incoming path is [%s].", thePath); // Debug Only
+ //fprintf(stdout, "payload starts at line [%d]", payloadStartingLine); // Debug Only
 
 
 } // End Function processRequest()
@@ -625,17 +779,19 @@ void processRequest(char* data, int len)
 //***************************************************************************
 int setupServer(void)
 {
-  tv.tv_sec = 1;  // timeout value to wait for socket to have data
-  tv.tv_usec = 0;
+  tv.tv_sec = 0;  // timeout value to wait for socket to have data
+  tv.tv_usec = 500;
 
-  if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-      perror("socket");
-      return -1;
+  if ((sockfd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
+  {
+   SAY("Error creating socket");
+   perror("socket");
+   return -1;
   }
-  else fprintf(stdout, "created socket...\n");
+  //else fprintf(stdout, "created socket...\n");
 
   setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  fprintf(stdout, "Set sockopt...\n");
+  //fprintf(stdout, "Set sockopt...\n");
 
   my_addr.sin_family = AF_INET;         /* host byte order */
   my_addr.sin_port = htons(MYPORT);     /* short, network byte order */
@@ -644,18 +800,20 @@ int setupServer(void)
 
   if (bind(sockfd, (struct sockaddr *)&my_addr, sizeof(struct sockaddr)) == -1)
   {
-      perror("bind");
-      return -2;
+   SAY("Error binding socket");
+   perror("bind");
+   return -2;
   }
-  fprintf(stdout, "bind socket...\n");
+  //fprintf(stdout, "bind socket...\n");
 
 
   if (listen(sockfd, BACKLOG) == -1)
   {
-      perror("listen");
-      return -3;
+   SAY("Error listening to socket");
+   perror("listen");
+   return -3;
   }
-  fprintf(stdout, "listening...\n");
+  //fprintf(stdout, "listening...\n");
 
 
   // add the listener to the master set
@@ -677,13 +835,14 @@ int pollServer(void)
  int nbytes = 0;
  int retVal;
 
- fprintf(stdout, "checking for incoming data...\n");
+ //fprintf(stdout, "checking for incoming data...\n");
 
  read_fds = master; // copy it
  if (select(fdmax+1, &read_fds, NULL, NULL, &tv) == -1)
  {
-   perror("select");
-   return -1;
+  SAY("Error selecting socket");
+  perror("select");
+  return -1;
  }
 
  // run through the existing connections looking for data to read
@@ -695,13 +854,16 @@ int pollServer(void)
 
   if (new_fd == -1)
   {
+   SAY("Error accepting socket");
    perror("accept");
    return -2;
   }
   else
   {
    their_addr = (struct sockaddr_in*)&temp_addr;
-   fprintf(stdout, "Incoming connection from [%s]...\n", inet_ntoa(their_addr->sin_addr));
+   //fprintf(stdout, "Incoming connection from [%s]...\n", inet_ntoa(their_addr->sin_addr));
+   SAY("Incoming connection from [%s]...", inet_ntoa(their_addr->sin_addr));
+
    memset(buf, '\0', sizeof(buf));
 
    if ((nbytes = recv(new_fd, buf, sizeof buf, 0)) <= 0)
@@ -712,12 +874,14 @@ int pollServer(void)
     if (nbytes == 0)
     {
      // connection closed
-     fprintf(stdout, "selectserver: socket %d hung up\n", i);
+     //fprintf(stdout, "selectserver: socket %d hung up\n", i);
+     SAY("Unexpected Client Disconnect");
     }
-    else
+    else // -1 means no message available (EWOULDBLOCK is set)
     {
-     perror("recv");
-     return -3;
+     SAY("No incoming message");
+     //perror("recv"); // "Connection Reset by Peer"
+     //return -3;
     }
 
    }
@@ -725,7 +889,7 @@ int pollServer(void)
    {
     processRequest(buf, nbytes);
 
-    fprintf(stdout, "call handleSQL\n"); // Debug Only
+    //fprintf(stdout, "call handleSQL\n"); // Debug Only
     sprintf(resp, "%s\0", handleSQL()); // resp will be a fully-formed HTTP 200, etc
 
     send(new_fd, resp, strlen(resp), 0);
@@ -746,11 +910,33 @@ int pollServer(void)
 
 //***************************************************************************
 //***************************************************************************
-int main(void)
+int main(int argc, char* argv[])
 {
  int ret;
+ int shouldDemonize = 1;
 
- //if ((ret = _demon_stuff()) <= 0) return ret;
+ demonized = 0;
+
+ for (int x = 0; x < argc; x++)
+ {
+  //printf("Arg %d = [%s]\n", x, argv[x]);
+  if ((strcmp(argv[x], "-s") == 0) || (strcmp(argv[x], "--shell") == 0))
+  {
+   shouldDemonize = 0;
+   break;
+  }
+ }
+
+
+ if (shouldDemonize == 1)
+ {
+  if ((ret = _demon_stuff()) <= 0) return ret;
+ }
+ else
+ {
+  SAY("running in shell");
+ }
+
 
  if ((ret = initSQL()) < 0) return ret;
 
@@ -759,7 +945,7 @@ int main(void)
  while (1)
  {
   if ((ret = pollServer()) < 0) return ret;
-  sleep(2);
+  sleep(1);
  } // END while (1)
 
 
